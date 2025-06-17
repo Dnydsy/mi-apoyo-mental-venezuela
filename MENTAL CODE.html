@@ -1,0 +1,762 @@
+import React, { useState, useEffect, createContext, useContext, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, addDoc, collection, query, onSnapshot, orderBy, where } from 'firebase/firestore';
+
+// Context for Firebase and User
+const AppContext = createContext(null);
+
+const AppProvider = ({ children }) => {
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+
+    useEffect(() => {
+        try {
+            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
+
+            // Sign in with custom token if available, otherwise anonymously
+            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+            if (initialAuthToken) {
+                signInWithCustomToken(firebaseAuth, initialAuthToken)
+                    .then(() => {
+                        console.log("Signed in with custom token.");
+                    })
+                    .catch((error) => {
+                        console.error("Error signing in with custom token:", error);
+                        signInAnonymously(firebaseAuth)
+                            .then(() => console.log("Signed in anonymously."))
+                            .catch((err) => console.error("Anonymous sign-in error:", err));
+                    });
+            } else {
+                signInAnonymously(firebaseAuth)
+                    .then(() => console.log("Signed in anonymously."))
+                    .catch((err) => console.error("Anonymous sign-in error:", err));
+            }
+
+            // Listen for auth state changes
+            const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    setUserId(crypto.randomUUID()); // Fallback for unauthenticated users if anonymous fails
+                }
+                setIsAuthReady(true);
+            });
+
+            return () => unsubscribe();
+        } catch (error) {
+            console.error("Firebase initialization error:", error);
+        }
+    }, []);
+
+    const value = { db, auth, userId, isAuthReady };
+
+    return (
+        <AppContext.Provider value={value}>
+            {children}
+        </AppContext.Provider>
+    );
+};
+
+// Hook to use Firebase context
+const useAppContext = () => {
+    return useContext(AppContext);
+};
+
+// Main App Component
+const App = () => {
+    const { db, auth, userId, isAuthReady } = useAppContext();
+    const [selectedFeelings, setSelectedFeelings] = useState([]);
+    const [gratitudeEntry, setGratitudeEntry] = useState('');
+    const [moodEntries, setMoodEntries] = useState([]); // All mood entries, not just daily summary
+    const [gratitudeHistory, setGratitudeHistory] = useState([]);
+    const [currentView, setCurrentView] = useState('moodTracker');
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-anti-depresion-app';
+
+    // State for calendar
+    const [currentMonth, setCurrentMonth] = useState(new Date()); // Date object for the current month being viewed
+    const [selectedDate, setSelectedDate] = useState(new Date()); // Date object for the currently selected day
+
+    // States for AI Chat
+    const [chatHistory, setChatHistory] = useState([]);
+    const [chatInput, setChatInput] = useState('');
+    const [isThinking, setIsThinking] = useState(false);
+    const chatContainerRef = useRef(null);
+
+    // State for Emergency Modal
+    const [showEmergencyModal, setShowEmergencyModal] = useState(false);
+
+    // Define feelings and their associated colors/styles
+    const feelingsOptions = [
+        { name: 'Feliz', color: 'bg-yellow-300', text: 'text-yellow-900', border: 'border-yellow-400' },
+        { name: 'Triste', color: 'bg-blue-300', text: 'text-blue-900', border: 'border-blue-400' },
+        { name: 'Ansioso', color: 'bg-purple-300', text: 'text-purple-900', border: 'border-purple-400' },
+        { name: 'Calmado', color: 'bg-green-300', text: 'text-green-900', border: 'border-green-400' },
+        { name: 'Enojado', color: 'bg-red-300', text: 'text-red-900', border: 'border-red-400' },
+        { name: 'Esperanzado', color: 'bg-blue-100', text: 'text-blue-800', border: 'border-blue-200' },
+        { name: 'Agradecido', color: 'bg-yellow-100', text: 'text-yellow-800', border: 'border-yellow-200' },
+        { name: 'Cansado', color: 'bg-gray-300', text: 'text-gray-900', border: 'border-gray-400' },
+        { name: 'Aburrido', color: 'bg-gray-400', text: 'text-gray-900', border: 'border-gray-500' },
+        { name: 'Motivado', color: 'bg-purple-400', text: 'text-purple-900', border: 'border-purple-500' },
+        { name: 'Confundido', color: 'bg-orange-200', text: 'text-orange-900', border: 'border-orange-300' },
+        { name: 'Optimista', color: 'bg-lime-200', text: 'text-lime-900', border: 'border-lime-300' },
+        { name: 'Irritable', color: 'bg-red-200', text: 'text-red-900', border: 'border-red-300' },
+        { name: 'Estresado', color: 'bg-orange-300', text: 'text-orange-900', border: 'border-orange-400' },
+        { name: 'Alegre', color: 'bg-lime-300', text: 'text-lime-900', border: 'border-lime-400' },
+        { name: 'Frustrado', color: 'bg-red-400', text: 'text-red-900', border: 'border-red-500' },
+    ];
+
+    // Helper to get feeling details by name
+    const getFeelingDetails = (name) => feelingsOptions.find(f => f.name === name);
+
+    // Format date to YYYY-MM-DD string for internal use (e.g., grouping)
+    const formatDateToYYYYMMDD = (date) => {
+        const d = new Date(date);
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    };
+
+    // Format date to locale string for display (e.g., "lunes, 17 de junio de 2024")
+    const formatDisplayDate = (date) => {
+        return new Date(date).toLocaleDateString('es-ES', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    };
+
+    // Format time for display (e.g., "14:35")
+    const formatDisplayTime = (timestamp) => {
+        const d = new Date(timestamp);
+        return d.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+    };
+
+    // Fetch mood and gratitude history
+    useEffect(() => {
+        // Only proceed if Firestore instance, Auth instance, and an authenticated user are ready
+        // and the auth state has been initially checked.
+        if (!db || !auth || !isAuthReady) return;
+
+        const currentAuthenticatedUserId = auth.currentUser?.uid;
+
+        // If there's no authenticated user, then we should not attempt to fetch private user data.
+        if (!currentAuthenticatedUserId) {
+            console.warn("No authenticated user ID found for fetching private data. Skipping Firestore data fetch.");
+            setMoodEntries([]); // Clear data if no authenticated user
+            setGratitudeHistory([]); // Clear data if no authenticated user
+            return;
+        }
+
+        const moodCollectionRef = collection(db, `artifacts/${appId}/users/${currentAuthenticatedUserId}/moods`);
+        const gratitudeCollectionRef = collection(db, `artifacts/${appId}/users/${currentAuthenticatedUserId}/gratitude`);
+
+        // Real-time listener for mood entries
+        const unsubscribeMood = onSnapshot(query(moodCollectionRef, orderBy('timestamp', 'desc')), (snapshot) => {
+            const entries = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setMoodEntries(entries);
+        }, (error) => {
+            console.error("Error fetching mood entries:", error);
+        });
+
+        // Real-time listener for gratitude history
+        const unsubscribeGratitude = onSnapshot(query(gratitudeCollectionRef, orderBy('timestamp', 'desc')), (snapshot) => {
+            const entries = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setGratitudeHistory(entries);
+        }, (error) => {
+            console.error("Error fetching gratitude history:", error);
+        });
+
+        return () => {
+            unsubscribeMood();
+            unsubscribeGratitude();
+        };
+    }, [db, auth, isAuthReady, appId]); // Depend on 'auth' instead of 'userId' directly, as 'auth.currentUser' changes
+
+
+    // Scroll chat to bottom
+    useEffect(() => {
+        if (chatContainerRef.current) {
+            chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+        }
+    }, [chatHistory]);
+
+    // Clear chat history when switching away from AI chat tab
+    useEffect(() => {
+        if (currentView !== 'aiChat') {
+            setChatHistory([]);
+            setChatInput('');
+            setIsThinking(false);
+        }
+    }, [currentView]);
+
+    const handleFeelingToggle = (feelingName) => {
+        setSelectedFeelings((prevSelected) => {
+            if (prevSelected.includes(feelingName)) {
+                return prevSelected.filter((name) => name !== feelingName);
+            } else {
+                return [...prevSelected, feelingName];
+            }
+        });
+    };
+
+    const saveMoodEntry = async () => {
+        if (!db || !auth || !auth.currentUser) { // Check for auth.currentUser here
+            console.error("Firestore not initialized or user not authenticated.");
+            return;
+        }
+        if (selectedFeelings.length === 0) {
+            console.warn("No feelings selected. Not saving mood entry.");
+            return;
+        }
+        try {
+            const moodCollectionRef = collection(db, `artifacts/${appId}/users/${auth.currentUser.uid}/moods`); // Use auth.currentUser.uid
+            await addDoc(moodCollectionRef, { // Using addDoc to create a new document with unique ID
+                feelings: selectedFeelings,
+                timestamp: Date.now(), // Use current timestamp for new entry
+                dateString: formatDateToYYYYMMDD(selectedDate), // Store date in YYYY-MM-DD for grouping
+                displayDate: formatDisplayDate(selectedDate), // Store formatted date for display
+                displayTime: formatDisplayTime(Date.now()) // Store formatted time for display
+            });
+            setSelectedFeelings([]); // Clear selected feelings after saving
+            console.log(`Mood entry saved for ${formatDateToYYYYMMDD(selectedDate)}!`);
+        } catch (e) {
+            console.error("Error adding mood entry: ", e);
+        }
+    };
+
+    const saveGratitudeEntry = async () => {
+        if (!db || !auth || !auth.currentUser) { // Check for auth.currentUser here
+            console.error("Firestore not initialized or user not authenticated.");
+            return;
+        }
+        if (!gratitudeEntry.trim()) return; // Don't save empty entries
+        try {
+            const gratitudeCollectionRef = collection(db, `artifacts/${appId}/users/${auth.currentUser.uid}/gratitude`); // Use auth.currentUser.uid
+            await addDoc(gratitudeCollectionRef, { // Using addDoc to create a new document with unique ID
+                entry: gratitudeEntry,
+                timestamp: Date.now(),
+                date: new Date().toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: 'numeric' })
+            });
+            setGratitudeEntry(''); // Clear the input after saving
+            console.log("Gratitude entry saved!");
+        } catch (e) {
+            console.error("Error adding gratitude entry: ", e);
+        }
+    };
+
+    const deleteGratitudeEntry = async (id) => {
+        if (!db || !auth || !auth.currentUser) return; // Check for auth.currentUser here
+        try {
+            // Note: Firebase client libraries do not support direct deleteDoc for collectionRef.
+            // You need to explicitly reference the document to delete.
+            await setDoc(doc(db, `artifacts/${appId}/users/${auth.currentUser.uid}/gratitude`, id), { _deleted: true }, { merge: true }); // Use auth.currentUser.uid
+            console.log(`Gratitude entry ${id} marked for soft deletion.`);
+        } catch (e) {
+            console.error("Error deleting gratitude entry: ", e);
+        }
+    };
+
+    // Calendar rendering logic
+    const renderCalendarDays = () => {
+        const startDay = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), 1);
+        const endDay = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 0);
+        const numDays = endDay.getDate();
+        const firstDayOfWeek = startDay.getDay(); // 0 for Sunday, 1 for Monday, etc.
+
+        const days = [];
+        // Fill leading blank days
+        for (let i = 0; i < firstDayOfWeek; i++) {
+            days.push(<div key={`empty-${i}`} className="p-2 border border-gray-100 bg-gray-50 rounded-lg"></div>);
+        }
+
+        // Group mood entries by date for quick lookup in calendar
+        const moodEntriesByDate = moodEntries.reduce((acc, entry) => {
+            const date = entry.dateString;
+            if (!acc[date]) {
+                acc[date] = [];
+            }
+            acc[date].push(entry.feelings); // Store array of feelings
+            return acc;
+        }, {});
+
+
+        for (let i = 1; i <= numDays; i++) {
+            const day = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), i);
+            const isToday = formatDateToYYYYMMDD(day) === formatDateToYYYYMMDD(new Date());
+            const isSelected = formatDateToYYYYMMDD(day) === formatDateToYYYYMMDD(selectedDate);
+            const dayString = formatDateToYYYYMMDD(day);
+            const allFeelingsForDay = moodEntriesByDate[dayString] ? moodEntriesByDate[dayString].flat() : []; // Flatten array of arrays
+
+
+            days.push(
+                <div
+                    key={i}
+                    className={`p-2 border border-blue-100 bg-blue-50 rounded-lg cursor-pointer flex flex-col items-center justify-start min-h-[80px] transition-all duration-200
+                        ${isToday ? 'bg-blue-200 border-blue-400' : 'hover:bg-blue-100'}
+                        ${isSelected ? 'ring-2 ring-purple-500 ring-offset-2' : ''}
+                    `}
+                    onClick={() => setSelectedDate(day)}
+                >
+                    <span className={`font-semibold text-sm ${isToday ? 'text-blue-700' : 'text-gray-800'}`}>{i}</span>
+                    {allFeelingsForDay.length > 0 && (
+                        <div className="flex flex-wrap justify-center gap-1 mt-1">
+                            {/* Display up to a few unique feeling dots to indicate activity */}
+                            {[...new Set(allFeelingsForDay)].slice(0, 5).map((feelingName, index) => { // Show max 5 unique feeling dots
+                                const details = getFeelingDetails(feelingName);
+                                return details ? (
+                                    <span key={index} className={`w-3 h-3 rounded-full ${details.color}`} title={feelingName}></span>
+                                ) : null;
+                            })}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+        return days;
+    };
+
+    const goToPreviousMonth = () => {
+        setCurrentMonth(prevMonth => new Date(prevMonth.getFullYear(), prevMonth.getMonth() - 1, 1));
+    };
+
+    const goToNextMonth = () => {
+        setCurrentMonth(prevMonth => new Date(prevMonth.getFullYear(), prevMonth.getMonth() + 1, 1));
+    };
+
+    // AI Chat functions
+    const handleSendMessage = async () => {
+        if (!chatInput.trim() || isThinking) return;
+
+        const userMessage = chatInput;
+        // Add user message to chat history
+        setChatHistory(prev => [...prev, { role: 'user', text: userMessage }]);
+        setChatInput('');
+        setIsThinking(true);
+
+        try {
+            // Define the AI's persona and instructions
+            const systemInstruction = {
+                role: "user",
+                parts: [{ text: "Eres un compañero de apoyo emocional. Tu objetivo es escuchar, validar sentimientos y ofrecer sugerencias calmantes o de afrontamiento para mejorar el estado de ánimo. NUNCA des consejo médico o profesional. Siempre dirige a los usuarios a recursos de ayuda profesional si mencionan crisis, ideas suicidas o necesitan ayuda que exceda el apoyo emocional general. Mantén un tono empático, positivo y constructivo." }]
+            };
+
+            // Prepare chat history for the API call, including the system instruction
+            let currentChatHistory = [...chatHistory, { role: 'user', parts: [{ text: userMessage }] }];
+            const payload = { contents: [systemInstruction, ...currentChatHistory] }; // Prepend system instruction
+
+            const apiKey = ""; 
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                const aiResponse = result.candidates[0].content.parts[0].text;
+                setChatHistory(prev => [...prev, { role: 'model', text: aiResponse }]);
+            } else {
+                setChatHistory(prev => [...prev, { role: 'model', text: 'Lo siento, no pude generar una respuesta. Intenta de nuevo.' }]);
+            }
+        } catch (error) {
+            console.error("Error calling Gemini API:", error);
+            setChatHistory(prev => [...prev, { role: 'model', text: 'Hubo un error al comunicarse con la IA. Por favor, inténtalo más tarde.' }]);
+        } finally {
+            setIsThinking(false);
+        }
+    };
+
+    const entriesForSelectedDate = moodEntries
+        .filter(entry => entry.dateString === formatDateToYYYYMMDD(selectedDate))
+        .sort((a, b) => a.timestamp - b.timestamp); // Sort by timestamp to show in chronological order
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-100 via-purple-100 to-yellow-50 p-4 font-sans text-gray-800 flex flex-col items-center pb-20"> {/* Add padding for fixed button */}
+            <script src="https://cdn.tailwindcss.com"></script>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" />
+
+            <style>
+                {`
+                body { font-family: 'Inter', sans-serif; }
+                .tab-button {
+                    @apply px-4 py-2 rounded-xl text-sm font-medium transition-colors duration-200 border-2; /* Added rounded-xl and border-2 */
+                }
+                .tab-button.active {
+                    @apply bg-purple-500 text-white shadow-md border-yellow-300; /* Yellow border when active */
+                }
+                .tab-button:not(.active) {
+                    @apply text-purple-700 bg-purple-200 hover:bg-purple-300 border-purple-300 hover:border-blue-300; /* Purple border, blue on hover */
+                }
+                .card {
+                    @apply bg-white rounded-xl shadow-lg p-6 mb-6 w-full max-w-md;
+                }
+                .feeling-tag {
+                    @apply px-3 py-1 rounded-full text-sm font-semibold cursor-pointer border-2 transition-all duration-200;
+                }
+                .feeling-tag.selected {
+                    @apply ring-2 ring-offset-2;
+                }
+                .disabled-button {
+                    @apply opacity-50 cursor-not-allowed;
+                }
+                .chat-bubble-user {
+                    @apply bg-blue-200 text-blue-900 rounded-bl-xl rounded-tr-xl rounded-tl-xl p-3 max-w-[80%] self-end;
+                }
+                .chat-bubble-ai {
+                    @apply bg-gray-200 text-gray-800 rounded-br-xl rounded-tl-xl rounded-tr-xl p-3 max-w-[80%] self-start;
+                }
+                .emergency-button {
+                    @apply fixed bottom-4 left-1/2 -translate-x-1/2 bg-red-600 text-white font-bold py-3 px-6 rounded-full shadow-lg hover:bg-red-700 transition-colors duration-300 z-50;
+                }
+                .modal-overlay {
+                    @apply fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50;
+                }
+                .modal-content {
+                    @apply bg-white rounded-xl p-8 max-w-md w-11/12 shadow-2xl relative;
+                }
+                `}
+            </style>
+
+            <div className="w-full max-w-lg mb-6 text-center">
+                <h1 className="text-3xl font-bold text-purple-700 mb-2 rounded-lg p-2">Mi Apoyo Mental</h1> {/* Changed app title here */}
+                <p className="text-sm text-gray-600 mb-4 bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-3 rounded-md shadow-sm">
+                    ⚠️ Esta aplicación es una herramienta de apoyo y **NO sustituye la ayuda profesional**. Si necesitas ayuda inmediata, busca los recursos de emergencia en la sección "Recursos de Apoyo" o presiona el botón rojo "Necesito Ayuda Urgente".
+                </p>
+                {userId && (
+                    <p className="text-xs text-gray-500 mt-2">
+                        ID de Usuario: <span className="font-mono bg-gray-100 px-2 py-1 rounded-md text-gray-700 break-all">{userId}</span>
+                    </p>
+                )}
+            </div>
+
+            <div className="flex justify-center flex-wrap gap-2 mb-6 w-full max-w-md">
+                <button
+                    onClick={() => setCurrentView('moodTracker')}
+                    className={`tab-button ${currentView === 'moodTracker' ? 'active' : ''}`}
+                >
+                    Registro de Ánimo
+                </button>
+                <button
+                    onClick={() => setCurrentView('gratitudeJournal')}
+                    className={`tab-button ${currentView === 'gratitudeJournal' ? 'active' : ''}`}
+                >
+                    Diario de Gratitud
+                </button>
+                <button
+                    onClick={() => setCurrentView('aiChat')}
+                    className={`tab-button ${currentView === 'aiChat' ? 'active' : ''}`}
+                >
+                    Hablar con la IA
+                </button>
+                <button
+                    onClick={() => setCurrentView('resources')}
+                    className={`tab-button ${currentView === 'resources' ? 'active' : ''}`}
+                >
+                    Recursos de Apoyo
+                </button>
+            </div>
+
+            {isAuthReady ? (
+                <>
+                    {/* Mood Tracker View */}
+                    {currentView === 'moodTracker' && (
+                        <div className="card">
+                            <h2 className="text-xl font-semibold text-purple-600 mb-4">Registro Mensual de Ánimo</h2>
+
+                            <div className="flex justify-between items-center mb-4">
+                                <button onClick={goToPreviousMonth} className="p-2 rounded-xl bg-blue-200 text-blue-700 hover:bg-blue-300 transition-colors duration-200 border-2 border-blue-400">
+                                    &lt;
+                                </button>
+                                <h3 className="text-lg font-semibold text-purple-700">
+                                    {currentMonth.toLocaleDateString('es-ES', { month: 'long', year: 'numeric' })}
+                                </h3>
+                                <button onClick={goToNextMonth} className="p-2 rounded-xl bg-blue-200 text-blue-700 hover:bg-blue-300 transition-colors duration-200 border-2 border-blue-400">
+                                    &gt;
+                                </button>
+                            </div>
+
+                            <div className="grid grid-cols-7 gap-1 text-center text-sm font-medium text-gray-500 mb-2">
+                                <span>Dom</span>
+                                <span>Lun</span>
+                                <span>Mar</span>
+                                <span>Mié</span>
+                                <span>Jue</span>
+                                <span>Vie</span>
+                                <span>Sáb</span>
+                            </div>
+                            <div className="grid grid-cols-7 gap-1">
+                                {renderCalendarDays()}
+                            </div>
+
+                            <h3 className="text-lg font-semibold text-purple-600 mt-8 mb-4 border-t pt-4">
+                                Registrar Sentimientos para el {formatDisplayDate(selectedDate)}:
+                            </h3>
+                            <p className="text-sm text-gray-600 mb-4">Selecciona los sentimientos que describen tu momento actual:</p>
+                            <div className="flex flex-wrap gap-2 mb-6">
+                                {feelingsOptions.map((feeling) => (
+                                    <span
+                                        key={feeling.name}
+                                        className={`feeling-tag ${feeling.color} ${feeling.text} ${feeling.border} ${selectedFeelings.includes(feeling.name) ? `selected ring-${feeling.color.split('-')[1]}-500` : 'hover:opacity-80'}`}
+                                        onClick={() => handleFeelingToggle(feeling.name)}
+                                    >
+                                        {feeling.name}
+                                    </span>
+                                ))}
+                            </div>
+                            <button
+                                onClick={saveMoodEntry}
+                                disabled={selectedFeelings.length === 0}
+                                className={`w-full bg-purple-500 text-white py-3 rounded-lg font-semibold shadow-md hover:bg-purple-600 transition-colors duration-200 ${selectedFeelings.length === 0 ? 'disabled-button' : ''}`}
+                            >
+                                Guardar Sentimientos (Nueva Entrada)
+                            </button>
+
+                            <h3 className="text-lg font-semibold text-purple-600 mt-8 mb-4 border-t pt-4">
+                                Entradas del {formatDisplayDate(selectedDate)}:
+                            </h3>
+                            {entriesForSelectedDate.length === 0 ? (
+                                <p className="text-gray-500 text-center">No hay entradas de sentimientos para este día.</p>
+                            ) : (
+                                <ul className="space-y-3">
+                                    {entriesForSelectedDate.map((entry) => (
+                                        <li key={entry.id} className="bg-purple-50 p-4 rounded-lg shadow-sm">
+                                            <div className="flex justify-between items-center mb-2">
+                                                <span className="text-sm text-gray-600">{entry.displayTime}</span>
+                                            </div>
+                                            <div className="flex flex-wrap gap-2">
+                                                {Array.isArray(entry.feelings) && entry.feelings.map((feelingName, index) => {
+                                                    const details = getFeelingDetails(feelingName);
+                                                    return details ? (
+                                                        <span
+                                                            key={index}
+                                                            className={`px-3 py-1 rounded-full text-xs font-semibold ${details.color} ${details.text}`}
+                                                        >
+                                                            {feelingName}
+                                                        </span>
+                                                    ) : null;
+                                                })}
+                                            </div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Gratitude Journal View */}
+                    {currentView === 'gratitudeJournal' && (
+                        <div className="card">
+                            <h2 className="text-xl font-semibold text-purple-600 mb-4">Diario de Gratitud</h2>
+                            <textarea
+                                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-400 focus:border-transparent resize-y min-h-[100px]"
+                                placeholder="Escribe 3 cosas por las que estás agradecido/a hoy..."
+                                value={gratitudeEntry}
+                                onChange={(e) => setGratitudeEntry(e.target.value)}
+                            ></textarea>
+                            <button
+                                onClick={saveGratitudeEntry}
+                                disabled={!gratitudeEntry.trim()}
+                                className={`w-full bg-purple-500 text-white py-3 mt-4 rounded-lg font-semibold shadow-md hover:bg-purple-600 transition-colors duration-200 ${!gratitudeEntry.trim() ? 'disabled-button' : ''}`}
+                            >
+                                Guardar Entrada
+                            </button>
+
+                            <h3 className="text-lg font-semibold text-purple-600 mt-8 mb-4 border-t pt-4">Tus Entradas de Gratitud</h3>
+                            {gratitudeHistory.length === 0 ? (
+                                <p className="text-gray-500 text-center">Aún no hay entradas de gratitud.</p>
+                            ) : (
+                                <ul className="space-y-3">
+                                    {gratitudeHistory.map((entry) => (
+                                        <li key={entry.id} className="bg-yellow-50 p-4 rounded-lg shadow-sm flex flex-col">
+                                            <div className="flex justify-between items-start">
+                                                <p className="text-gray-800 flex-grow pr-4">{entry.entry}</p>
+                                                <button
+                                                    onClick={() => deleteGratitudeEntry(entry.id)}
+                                                    className="text-red-500 hover:text-red-700 transition-colors duration-200 ml-2 text-xl"
+                                                    title="Eliminar entrada"
+                                                >
+                                                    &times;
+                                                </button>
+                                            </div>
+                                            <span className="text-xs text-gray-500 self-end mt-2">
+                                                {entry.date}
+                                            </span>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
+                    )}
+
+                    {/* AI Chat View */}
+                    {currentView === 'aiChat' && (
+                        <div className="card flex flex-col h-[500px]">
+                            <h2 className="text-xl font-semibold text-purple-600 mb-4">Hablar con la IA</h2>
+                            <div ref={chatContainerRef} className="flex-grow overflow-y-auto border border-gray-200 rounded-lg p-4 mb-4 space-y-4">
+                                {chatHistory.length === 0 && (
+                                    <p className="text-gray-500 text-center">¡Hola! ¿En qué puedo ayudarte hoy?</p>
+                                )}
+                                {chatHistory.map((message, index) => (
+                                    <div key={index} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                        <div className={`${message.role === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'} shadow-md`}>
+                                            {message.text}
+                                        </div>
+                                    </div>
+                                ))}
+                                {isThinking && (
+                                    <div className="flex justify-start">
+                                        <div className="chat-bubble-ai animate-pulse">Pensando...</div>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="flex">
+                                <textarea
+                                    className="flex-grow p-3 border border-gray-300 rounded-l-lg focus:ring-2 focus:ring-purple-400 focus:border-transparent resize-none overflow-hidden"
+                                    placeholder="Escribe tu mensaje..."
+                                    value={chatInput}
+                                    onChange={(e) => {
+                                        setChatInput(e.target.value);
+                                        e.target.style.height = 'auto'; // Reset height
+                                        e.target.style.height = e.target.scrollHeight + 'px'; // Set height to scroll height
+                                    }}
+                                    onKeyPress={(e) => {
+                                        if (e.key === 'Enter' && !e.shiftKey) {
+                                            e.preventDefault();
+                                            handleSendMessage();
+                                        }
+                                    }}
+                                    rows={1}
+                                    style={{ minHeight: '48px', maxHeight: '100px' }} // Set min-height and max-height for textarea
+                                ></textarea>
+                                <button
+                                    onClick={handleSendMessage}
+                                    disabled={!chatInput.trim() || isThinking}
+                                    className={`bg-purple-500 text-white p-3 rounded-r-lg font-semibold shadow-md hover:bg-purple-600 transition-colors duration-200 ${(!chatInput.trim() || isThinking) ? 'disabled-button' : ''}`}
+                                >
+                                    Enviar
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Resources View */}
+                    {currentView === 'resources' && (
+                        <div className="card">
+                            <h2 className="text-xl font-semibold text-purple-600 mb-4">Recursos de Apoyo</h2>
+                            <p className="text-gray-700 mb-4">
+                                Recuerda, no estás solo/a. Buscar ayuda es un signo de fortaleza.
+                            </p>
+                            <ul className="space-y-4">
+                                <li>
+                                    <h4 className="font-semibold text-gray-800">Líneas de Ayuda y Emergencia:</h4>
+                                    <ul className="list-disc list-inside text-gray-700 ml-2">
+                                        <li>**Línea de Prevención del Suicidio (Venezuela):** <a href="tel:+582124168051" className="text-blue-600 hover:underline">0212-4168051</a> (Teléfono de Emergencia Psicológica)</li>
+                                        <li>**Psicólogos Sin Fronteras Venezuela:** Busca en línea sus contactos y servicios para apoyo psicológico.</li>
+                                        <li>**Línea de Vida (Internacional - IASP):** Encuentra una línea de ayuda en tu país en <a href="https://www.iasp.info/resources/Crisis_Centres/" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">IASP Crisis Centres</a></li>
+                                        <li>**Número de Emergencias (General):** Llama al 911 o a tu número de emergencia local.</li>
+                                    </ul>
+                                </li>
+                                <li>
+                                    <h4 className="font-semibold text-gray-800">Cuidado Personal y Actividades Sugeridas:</h4>
+                                    <ul className="list-disc list-inside text-gray-700 ml-2">
+                                        <li>**Ejercicio:** Caminar, correr, bailar, etc.</li>
+                                        <li>**Mindfulness y Meditación:** Hay muchas apps y videos gratuitos.</li>
+                                        <li>**Conectar con la Naturaleza:** Pasa tiempo al aire libre.</li>
+                                        <li>**Hobbies:** Dedica tiempo a actividades que disfrutes.</li>
+                                        <li>**Mantén Contacto Social:** Habla con amigos o familiares.</li>
+                                    </ul>
+                                </li>
+                                <li>
+                                    <h4 className="font-semibold text-gray-800">Buscar Ayuda Profesional:</h4>
+                                    <p className="text-gray-700 ml-2">
+                                        Considera hablar con un terapeuta, consejero o psiquiatra. La salud mental es tan importante como la física.
+                                    </p>
+                                </li>
+                            </ul>
+                        </div>
+                    )}
+                </>
+            ) : (
+                <div className="text-center p-8 bg-white rounded-lg shadow-lg">
+                    <p className="text-lg text-purple-600">Cargando aplicación...</p>
+                    <p className="text-sm text-gray-500 mt-2">Esto puede tomar un momento.</p>
+                </div>
+            )}
+
+            {/* Emergency Button */}
+            <button
+                onClick={() => setShowEmergencyModal(true)}
+                className="emergency-button"
+            >
+                Necesito Ayuda Urgente
+            </button>
+
+            {/* Emergency Modal */}
+            {showEmergencyModal && (
+                <div className="modal-overlay">
+                    <div className="modal-content">
+                        <button
+                            onClick={() => setShowEmergencyModal(false)}
+                            className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 text-3xl font-bold"
+                        >
+                            &times;
+                        </button>
+                        <h2 className="text-2xl font-bold text-red-700 mb-4">¡ALERTA DE EMERGENCIA!</h2>
+                        <p className="text-lg text-gray-800 mb-4">
+                            Si estás teniendo pensamientos suicidas o sientes que no puedes más, por favor, busca ayuda INMEDIATA. Tu vida es importante.
+                        </p>
+                        <p className="text-md text-gray-700 font-semibold mb-2">Recursos de Ayuda Urgente:</p>
+                        <ul className="list-disc list-inside text-gray-700 mb-4 space-y-2">
+                            <li>
+                                **Línea de Prevención del Suicidio (Venezuela):**
+                                <br />
+                                <a href="tel:+582124168051" className="text-blue-600 hover:underline">0212-4168051</a> (Teléfono de Emergencia Psicológica)
+                            </li>
+                            <li>
+                                **Número de Emergencias (General):**
+                                <br />
+                                Llama al **911** o a tu número de emergencia local.
+                            </li>
+                            <li>
+                                **Contacta a un Profesional:**
+                                <br />
+                                Habla con un terapeuta, psiquiatra o tu médico de confianza.
+                            </li>
+                            <li>
+                                **Comparte con Alguien de Confianza:**
+                                <br />
+                                Un familiar, amigo, o persona de apoyo.
+                            </li>
+                            <li>
+                                **Línea de Vida (Internacional - IASP):**
+                                <br />
+                                Encuentra una línea de ayuda en tu país en <a href="https://www.iasp.info/resources/Crisis_Centres/" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">IASP Crisis Centres</a>
+                            </li>
+                        </ul>
+                        <p className="text-sm text-gray-600">
+                            No estás solo/a. Hay ayuda disponible.
+                        </p>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+// Export the App wrapped with the Provider
+export default () => (
+    <AppProvider>
+        <App />
+    </AppProvider>
+);
